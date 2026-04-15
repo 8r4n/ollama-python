@@ -1,10 +1,15 @@
 import contextlib
+import io
 import ipaddress
 import json
 import os
 import platform
+import shutil
 import sys
+import tarfile
+import tempfile
 import urllib.parse
+from datetime import datetime, timezone
 from hashlib import sha256
 from os import PathLike
 from pathlib import Path
@@ -621,6 +626,46 @@ class Client(BaseClient):
       self._request_raw('POST', f'/api/blobs/{digest}', content=r)
 
     return digest
+
+  def save(self, model: str, path: Union[str, Path], models_dir: Optional[Union[str, Path]] = None) -> None:
+    """
+    Export a locally-available Ollama model to a portable .tar.gz archive.
+
+    The archive can be physically transferred to an airgapped machine and
+    imported into a locally-running Ollama instance using ``load()``.
+
+    Args:
+      model: The model to export, e.g. ``'llama3:latest'``.
+      path: Destination file path for the ``.tar.gz`` archive.
+      models_dir: Override the Ollama models directory. Defaults to the value
+                  of the ``OLLAMA_MODELS`` env var, or ``~/.ollama/models``.
+
+    Raises:
+      FileNotFoundError: If the model has not been pulled locally or a blob
+                         is missing from the models directory.
+    """
+    _save_model(model, path, models_dir)
+
+  def load(self, model: str, path: Union[str, Path], models_dir: Optional[Union[str, Path]] = None) -> None:
+    """
+    Import a model from a .tar.gz archive previously created by ``save()``
+    into the local Ollama models directory.
+
+    Ollama discovers the imported model automatically without requiring a
+    restart. The model is registered under the name given by ``model``.
+
+    Args:
+      model: The model name to register, e.g. ``'llama3:latest'``.
+      path: Path to the ``.tar.gz`` archive.
+      models_dir: Override the Ollama models directory. Defaults to the value
+                  of the ``OLLAMA_MODELS`` env var, or ``~/.ollama/models``.
+
+    Raises:
+      FileNotFoundError: If the archive path does not exist.
+      ValueError: If the archive contains unsafe paths, symlinks, or blobs
+                  whose SHA-256 digest does not match their filename.
+    """
+    _load_model(model, path, models_dir)
 
   def list(self) -> ListResponse:
     return self._request(
@@ -1263,6 +1308,23 @@ class AsyncClient(BaseClient):
 
     return digest
 
+  async def save(self, model: str, path: Union[str, Path], models_dir: Optional[Union[str, Path]] = None) -> None:
+    """
+    Export a locally-available Ollama model to a portable .tar.gz archive.
+
+    See ``Client.save`` for full documentation.
+    """
+    await anyio.to_thread.run_sync(lambda: _save_model(model, path, models_dir))
+
+  async def load(self, model: str, path: Union[str, Path], models_dir: Optional[Union[str, Path]] = None) -> None:
+    """
+    Import a model from a .tar.gz archive previously created by ``save()``
+    into the local Ollama models directory.
+
+    See ``Client.load`` for full documentation.
+    """
+    await anyio.to_thread.run_sync(lambda: _load_model(model, path, models_dir))
+
   async def list(self) -> ListResponse:
     return await self._request(
       ListResponse,
@@ -1338,6 +1400,242 @@ def _as_path(s: Optional[Union[str, PathLike]]) -> Union[Path, None]:
     except Exception:
       ...
   return None
+
+
+def _get_ollama_models_dir() -> Path:
+  """Return the Ollama models directory.
+
+  Resolution order:
+  1. ``OLLAMA_MODELS`` environment variable (explicit override).
+  2. The running ``ollama serve`` process's HOME, read from ``/proc`` on Linux.
+  3. Common service-user locations (``/usr/share/ollama``, ``/var/lib/ollama``).
+  4. Current user's ``~/.ollama/models`` (fallback / non-systemd installs).
+  """
+  env = os.getenv('OLLAMA_MODELS')
+  if env:
+    return Path(env)
+
+  # Try to read HOME from the running ollama server process via /proc.
+  if platform.system() != 'Windows':
+    try:
+      import glob as _glob
+      for comm_path in _glob.glob('/proc/*/comm'):
+        try:
+          if Path(comm_path).read_text().strip() == 'ollama':
+            pid_dir = Path(comm_path).parent
+            environ = (pid_dir / 'environ').read_bytes()
+            for entry in environ.split(b'\x00'):
+              if entry.startswith(b'HOME='):
+                home = Path(entry[5:].decode())
+                candidate = home / '.ollama' / 'models'
+                if candidate.is_dir():
+                  return candidate
+        except (PermissionError, FileNotFoundError, ValueError):
+          continue
+    except Exception:
+      pass
+
+    # Well-known service-user home locations (systemd installs on Linux).
+    for base in (Path('/usr/share/ollama'), Path('/var/lib/ollama')):
+      candidate = base / '.ollama' / 'models'
+      try:
+        if candidate.is_dir():
+          return candidate
+      except PermissionError:
+        # Directory exists but is owned by the service user; return the path
+        # anyway so the caller can decide whether they have access.
+        return candidate
+
+  if platform.system() == 'Windows':
+    base = Path(os.environ.get('USERPROFILE', str(Path.home())))
+  else:
+    base = Path.home()
+  return base / '.ollama' / 'models'
+
+
+def _parse_model_ref(model: str):
+  """
+  Parse a model reference into (registry, namespace, name, tag).
+
+  Examples::
+
+    'llama3'               -> ('registry.ollama.ai', 'library', 'llama3', 'latest')
+    'llama3:7b'            -> ('registry.ollama.ai', 'library', 'llama3', '7b')
+    'user/model'           -> ('registry.ollama.ai', 'user', 'model', 'latest')
+    'user/model:tag'       -> ('registry.ollama.ai', 'user', 'model', 'tag')
+    'reg.io/ns/model:tag'  -> ('reg.io', 'ns', 'model', 'tag')
+  """
+  if '/' in model:
+    last_slash = model.rfind('/')
+    last_segment = model[last_slash + 1:]
+    path_prefix = model[:last_slash]
+    if ':' in last_segment:
+      colon = last_segment.rfind(':')
+      name_no_tag = last_segment[:colon]
+      tag = last_segment[colon + 1:]
+    else:
+      name_no_tag = last_segment
+      tag = 'latest'
+    full_path = f'{path_prefix}/{name_no_tag}'
+  else:
+    if ':' in model:
+      colon = model.rfind(':')
+      full_path = model[:colon]
+      tag = model[colon + 1:]
+    else:
+      full_path = model
+      tag = 'latest'
+
+  parts = full_path.split('/')
+  if len(parts) == 1:
+    return 'registry.ollama.ai', 'library', parts[0], tag
+  elif len(parts) == 2:
+    return 'registry.ollama.ai', parts[0], parts[1], tag
+  else:
+    return parts[0], parts[1], '/'.join(parts[2:]), tag
+
+
+def _validate_tar_member(member: tarfile.TarInfo, target_dir: Path) -> None:
+  """Reject tar members that could escape the extraction directory."""
+  if os.path.isabs(member.name):
+    raise ValueError(f'Unsafe tar member with absolute path: {member.name!r}')
+  target_resolved = target_dir.resolve()
+  resolved = (target_dir / member.name).resolve()
+  if not str(resolved).startswith(str(target_resolved) + os.sep):
+    raise ValueError(f'Unsafe tar member that escapes target directory: {member.name!r}')
+  if member.issym() or member.islnk():
+    raise ValueError(f'Tar member is a symlink, which is not permitted: {member.name!r}')
+
+
+def _save_model(model: str, path: Union[str, Path], models_dir: Optional[Union[str, Path]] = None) -> None:
+  """Core implementation of model export — used by both Client.save and AsyncClient.save."""
+  models_path = Path(models_dir) if models_dir else _get_ollama_models_dir()
+  registry, namespace, name, tag = _parse_model_ref(model)
+
+  manifest_path = models_path / 'manifests' / registry / namespace / name / tag
+  if not manifest_path.exists():
+    raise FileNotFoundError(f'Model manifest not found: {manifest_path}. Has the model been pulled?')
+
+  manifest_data = manifest_path.read_bytes()
+  manifest = json.loads(manifest_data)
+
+  # Collect all blob digests referenced by the manifest.
+  digests: List[str] = []
+  if config_digest := manifest.get('config', {}).get('digest'):
+    digests.append(config_digest)
+  for layer in manifest.get('layers', []):
+    if d := layer.get('digest'):
+      digests.append(d)
+
+  # Verify blobs exist before opening the output archive.
+  blob_paths: Dict[str, Path] = {}
+  for digest in digests:
+    blob_filename = digest.replace(':', '-')
+    blob_path = models_path / 'blobs' / blob_filename
+    if not blob_path.exists():
+      raise FileNotFoundError(f'Blob not found: {blob_path}')
+    blob_paths[digest] = blob_path
+
+  meta = {
+    'model': model,
+    'registry': registry,
+    'namespace': namespace,
+    'name': name,
+    'tag': tag,
+    'exported_at': datetime.now(timezone.utc).isoformat(),
+  }
+  meta_bytes = json.dumps(meta, indent=2).encode()
+
+  with tarfile.open(path, 'w:gz') as tf:
+    # meta.json — written from memory, no temp file required.
+    info = tarfile.TarInfo(name='meta.json')
+    info.size = len(meta_bytes)
+    tf.addfile(info, io.BytesIO(meta_bytes))
+
+    # manifest.json
+    info = tarfile.TarInfo(name='manifest.json')
+    info.size = len(manifest_data)
+    tf.addfile(info, io.BytesIO(manifest_data))
+
+    # blobs/
+    for digest, blob_path in blob_paths.items():
+      blob_filename = digest.replace(':', '-')
+      tf.add(blob_path, arcname=f'blobs/{blob_filename}')
+
+
+def _load_model(model: str, path: Union[str, Path], models_dir: Optional[Union[str, Path]] = None) -> None:
+  """Core implementation of model import — used by both Client.load and AsyncClient.load."""
+  archive_path = Path(path)
+  if not archive_path.exists():
+    raise FileNotFoundError(f'Archive not found: {archive_path}')
+
+  models_path = Path(models_dir) if models_dir else _get_ollama_models_dir()
+  registry, namespace, name, tag = _parse_model_ref(model)
+
+  with tempfile.TemporaryDirectory() as tmpdir:
+    tmp = Path(tmpdir)
+
+    # Validate every member before extraction to prevent path traversal.
+    with tarfile.open(archive_path, 'r:gz') as tf:
+      members = tf.getmembers()
+      for member in members:
+        _validate_tar_member(member, tmp)
+      # extractall is safe here: all members have been validated above.
+      try:
+        tf.extractall(tmp, filter='data')
+      except TypeError:
+        # filter parameter was added in Python 3.12; fall back on older versions.
+        tf.extractall(tmp)  # noqa: S202
+
+    manifest_file = tmp / 'manifest.json'
+    if not manifest_file.exists():
+      raise ValueError('Archive is missing manifest.json')
+    manifest_data = manifest_file.read_bytes()
+    manifest = json.loads(manifest_data)
+
+    # Collect expected blob digests.
+    digests: List[str] = []
+    if config_digest := manifest.get('config', {}).get('digest'):
+      digests.append(config_digest)
+    for layer in manifest.get('layers', []):
+      if d := layer.get('digest'):
+        digests.append(d)
+
+    # Verify each blob's SHA-256 checksum, then copy into the models directory.
+    blobs_dst = models_path / 'blobs'
+    blobs_dst.mkdir(parents=True, exist_ok=True)
+
+    for digest in digests:
+      algo, expected_hex = digest.split(':', 1)
+      if algo != 'sha256':
+        raise ValueError(f'Unsupported digest algorithm: {algo!r}')
+
+      blob_filename = digest.replace(':', '-')
+      src = tmp / 'blobs' / blob_filename
+      if not src.exists():
+        raise ValueError(f'Archive is missing blob: {blob_filename!r}')
+
+      actual = sha256()
+      with open(src, 'rb') as f:
+        while True:
+          chunk = f.read(32 * 1024)
+          if not chunk:
+            break
+          actual.update(chunk)
+      if actual.hexdigest() != expected_hex:
+        raise ValueError(f'Digest mismatch for blob {blob_filename!r}: archive may be corrupt')
+
+      dst = blobs_dst / blob_filename
+      if not dst.exists():
+        shutil.copy2(src, dst)
+
+    # Write the manifest last; Ollama detects it without a restart.
+    manifest_dir = models_path / 'manifests' / registry / namespace / name
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    (manifest_dir / tag).write_bytes(manifest_data)
+
+
+
 
 
 def _parse_host(host: Optional[str]) -> str:

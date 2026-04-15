@@ -39,6 +39,8 @@ __all__ = [
   'Tool',
   'WebFetchResponse',
   'WebSearchResponse',
+  'load',
+  'save',
 ]
 
 _client = Client()
@@ -50,6 +52,8 @@ embeddings = _client.embeddings
 pull = _client.pull
 push = _client.push
 create = _client.create
+save = _client.save
+load = _client.load
 delete = _client.delete
 list = _client.list
 copy = _client.copy

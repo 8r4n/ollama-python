@@ -1578,7 +1578,16 @@ def _load_model(model: str, path: Union[str, Path], models_dir: Optional[Union[s
   models_path = Path(models_dir) if models_dir else _get_ollama_models_dir()
   registry, namespace, name, tag = _parse_model_ref(model)
 
-  with tempfile.TemporaryDirectory() as tmpdir:
+  # Prefer a temp dir on the same filesystem as the archive so that the
+  # extraction does not fill a small tmpfs (e.g. the default /tmp on Linux).
+  # Fall back to the system default if the archive's parent is not writable.
+  archive_parent = archive_path.resolve().parent
+  try:
+    tmp_base = archive_parent if os.access(archive_parent, os.W_OK) else None
+  except OSError:
+    tmp_base = None
+
+  with tempfile.TemporaryDirectory(dir=tmp_base) as tmpdir:
     tmp = Path(tmpdir)
 
     # Validate every member before extraction to prevent path traversal.

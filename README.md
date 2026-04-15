@@ -341,6 +341,66 @@ The models directory is resolved in this priority order:
 4. Well-known service paths (`/usr/share/ollama/.ollama/models`, `/var/lib/ollama/.ollama/models`)
 5. `~/.ollama/models`
 
+### Idempotent import
+
+`load()` only copies blobs that are not already present in the destination models directory. Re-importing the same archive (or a different archive that shares blobs, e.g. a fine-tune of the same base model) is safe and will not overwrite existing files.
+
+### Disk space planning
+
+The archive size is roughly equal to the total size of the model's blobs (weights + tokeniser + config), compressed with gzip. Allow for the following temporary space during each operation:
+
+| Operation | Space required |
+|---|---|
+| `save()` | 1× model size (the archive itself) |
+| `load()` | 1× model size (temporary extraction) + 1× model size (blobs in models dir) |
+
+To check the size of a model before exporting:
+
+```python
+import ollama
+
+info = ollama.show('llama3.2:latest')
+total = sum(d.size or 0 for d in (info.details and []) or [])
+# Or simply inspect the blobs directory beforehand:
+# ls -lh ~/.ollama/models/blobs/
+```
+
+### Error handling
+
+Both `save()` and `load()` raise standard Python exceptions; no special Ollama exception types are used for these operations.
+
+```python
+import ollama
+
+# Export
+try:
+    ollama.save('llama3.2:latest', 'llama3.2-latest.tar.gz')
+except FileNotFoundError as exc:
+    # Model has not been pulled, or a blob is missing from the models directory
+    print(f'Export failed — model not found locally: {exc}')
+    # Pull the model first: ollama.pull('llama3.2:latest')
+
+# Import
+try:
+    ollama.load('llama3.2:latest', 'llama3.2-latest.tar.gz')
+except FileNotFoundError as exc:
+    # Archive path does not exist
+    print(f'Import failed — archive not found: {exc}')
+except ValueError as exc:
+    # Archive is missing required entries, contains unsafe paths or symlinks,
+    # or a blob's SHA-256 digest does not match its filename (corrupt archive)
+    print(f'Import failed — archive invalid or corrupt: {exc}')
+```
+
+### Security
+
+Every archive member is validated before extraction:
+
+- Absolute paths are rejected.
+- Path-traversal entries (e.g. `../../etc/passwd`) are rejected.
+- Symlinks and hard links are rejected.
+- Each blob's SHA-256 digest is verified against its filename after extraction. A mismatch raises `ValueError` before any blob is written to the models directory.
+
 ### CLI helper
 
 The `examples/airgap-transfer.py` script provides a command-line interface:

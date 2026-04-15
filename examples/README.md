@@ -112,6 +112,20 @@ Requirement: `pip install tqdm`
 
 - [create.py](create.py)
 
+### Airgapped transfer - Export and import models without internet access
+
+Export a model to a portable `.tar.gz` archive on a connected machine, transfer it via USB drive or SCP, then import it into Ollama on an airgapped machine.
+
+```sh
+# Connected machine — export
+python examples/airgap-transfer.py export llama3.2:latest llama3.2-latest.tar.gz
+
+# Airgapped machine — import
+python examples/airgap-transfer.py import llama3.2:latest llama3.2-latest.tar.gz
+```
+
+- [airgap-transfer.py](airgap-transfer.py)
+
 ### Ollama Embed - Generate embeddings with a model
 
 - [embed.py](embed.py)

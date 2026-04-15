@@ -250,6 +250,112 @@ ollama.embed(model='gemma3', input=['The sky is blue because of rayleigh scatter
 ollama.ps()
 ```
 
+### Save
+
+Export a locally-available model to a portable `.tar.gz` archive:
+
+```python
+ollama.save('llama3.2:latest', 'llama3.2-latest.tar.gz')
+```
+
+### Load
+
+Import a model from an archive previously created by `save()`:
+
+```python
+ollama.load('llama3.2:latest', 'llama3.2-latest.tar.gz')
+```
+
+## Airgapped transfer
+
+Models can be exported on a network-connected machine, physically transferred to an airgapped (network-disconnected) environment, and imported into a locally-running Ollama instance — no internet access required on the destination.
+
+### Archive format
+
+The `.tar.gz` archive produced by `save()` contains:
+
+| Entry | Description |
+|---|---|
+| `meta.json` | Model name, tag, and export timestamp |
+| `manifest.json` | Ollama manifest (config digest, layer digests, media types) |
+| `blobs/<digest>` | All model blobs (weights, tokeniser, config) |
+
+Every blob is verified against its SHA-256 digest on import.
+
+### Workflow
+
+**1. Export on the connected machine**
+
+```python
+import ollama
+
+# Pull the model first if not already present
+# ollama.pull('llama3.2:latest')
+
+ollama.save('llama3.2:latest', 'llama3.2-latest.tar.gz')
+```
+
+**2. Transfer the archive**
+
+Copy `llama3.2-latest.tar.gz` to the airgapped machine via USB drive, SCP, or any out-of-band mechanism available in your environment.
+
+**3. Import on the airgapped machine**
+
+```python
+import ollama
+
+ollama.load('llama3.2:latest', 'llama3.2-latest.tar.gz')
+
+# The model is immediately available
+response = ollama.generate(model='llama3.2:latest', prompt='Why is the sky blue?')
+print(response.response)
+```
+
+### Async usage
+
+```python
+import asyncio
+from ollama import AsyncClient
+
+async def transfer():
+    client = AsyncClient()
+    await client.save('llama3.2:latest', 'llama3.2-latest.tar.gz')
+    await client.load('llama3.2:latest', 'llama3.2-latest.tar.gz')
+
+asyncio.run(transfer())
+```
+
+### Custom models directory
+
+If Ollama stores its models in a non-default location (e.g. set via the `OLLAMA_MODELS` environment variable), pass `models_dir` explicitly:
+
+```python
+ollama.save('llama3.2:latest', 'llama3.2-latest.tar.gz', models_dir='/mnt/data/ollama/models')
+ollama.load('llama3.2:latest', 'llama3.2-latest.tar.gz', models_dir='/mnt/data/ollama/models')
+```
+
+The models directory is resolved in this priority order:
+1. The `models_dir` argument
+2. The `OLLAMA_MODELS` environment variable
+3. The running Ollama process's home directory (detected via `/proc`)
+4. Well-known service paths (`/usr/share/ollama/.ollama/models`, `/var/lib/ollama/.ollama/models`)
+5. `~/.ollama/models`
+
+### CLI helper
+
+The `examples/airgap-transfer.py` script provides a command-line interface:
+
+```sh
+# Connected machine — export
+python examples/airgap-transfer.py export llama3.2:latest llama3.2-latest.tar.gz
+
+# Airgapped machine — import
+python examples/airgap-transfer.py import llama3.2:latest llama3.2-latest.tar.gz
+
+# Override the models directory
+python examples/airgap-transfer.py export llama3.2:latest llama3.2-latest.tar.gz --models-dir /mnt/data/ollama/models
+```
+
 ## Errors
 
 Errors are raised if requests return an error status or if an error is detected while streaming.

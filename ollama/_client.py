@@ -1546,7 +1546,9 @@ def _save_model(model: str, path: Union[str, Path], models_dir: Optional[Union[s
   }
   meta_bytes = json.dumps(meta, indent=2).encode()
 
-  with tarfile.open(path, 'w:gz') as tf:
+  # Use streaming mode (w|gz) to avoid large gzip buffer flushes and mmap
+  # issues that can cause SIGBUS on WSL when handling multi-GB blobs.
+  with tarfile.open(path, 'w|gz') as tf:
     # meta.json — written from memory, no temp file required.
     info = tarfile.TarInfo(name='meta.json')
     info.size = len(meta_bytes)
@@ -1557,10 +1559,14 @@ def _save_model(model: str, path: Union[str, Path], models_dir: Optional[Union[s
     info.size = len(manifest_data)
     tf.addfile(info, io.BytesIO(manifest_data))
 
-    # blobs/
+    # blobs/ — use explicit addfile with open file to avoid mmap
     for digest, blob_path in blob_paths.items():
       blob_filename = digest.replace(':', '-')
-      tf.add(blob_path, arcname=f'blobs/{blob_filename}')
+      blob_path = Path(blob_path)
+      blob_info = tarfile.TarInfo(name=f'blobs/{blob_filename}')
+      blob_info.size = blob_path.stat().st_size
+      with open(blob_path, 'rb') as blob_fh:
+        tf.addfile(blob_info, blob_fh)
 
 
 def _load_model(model: str, path: Union[str, Path], models_dir: Optional[Union[str, Path]] = None) -> None:
